@@ -40,7 +40,7 @@ function wmoToBucket(code){
 }
 function featuresFromWeather(wx){
   const tempC = wx.temperature;
-  const tempNorm = (clamp(tempC, -10, 40) + 10) / 50; // -10..40 → 0..1
+  const tempNorm = (clamp(tempC, -10, 40) + 10) / 50;
   const bucket = wmoToBucket(wx.weathercode);
   const bucketNorm = bucket / 5;
   const isDay = wx.is_day ? 1 : 0;
@@ -114,8 +114,7 @@ async function fetchWeatherMetNo(env, lat, lon){
   const ts = j.properties?.timeseries?.[0];
   if (!ts) throw new Error("METNO: empty timeseries");
   const temp = ts.data?.instant?.details?.air_temperature;
-  const symbol = ts.data?.next_1_hours?.summary?.symbol_code
-              || ts.data?.next_6_hours?.summary?.symbol_code || "";
+  const symbol = ts.data?.next_1_hours?.summary?.symbol_code || ts.data?.next_6_hours?.summary?.symbol_code || "";
   const weathercode = symbolToWmoLike(symbol);
   const iso = ts.time || "";
   const hour = Number(iso.slice(11,13) || 0);
@@ -130,7 +129,7 @@ async function fetchWeather(env, lat, lon){
     const cw = await fetchWeatherOpenMeteo(env, lat, lon);
     wxCachePut(key, cw);
     return cw;
-  } catch(_) { /* fallthrough */ }
+  } catch(_) {}
   const cw2 = await fetchWeatherMetNo(env, lat, lon);
   wxCachePut(key, cw2);
   return cw2;
@@ -176,36 +175,63 @@ async function getAvailableGenres(env){
   globalThis.__genres = { list, ts: Date.now() };
   return list;
 }
-async function recommendTrack(env, mood, seeds){
-  const avail = await getAvailableGenres(env);
-  let cleaned = Array.from(new Set((seeds || []).map(normalizeGenre).filter(g => avail.has(g))));
-  if (cleaned.length === 0) cleaned = ["pop","rock","dance"];
-
+async function searchTrackByMood(env, mood, seeds, market = "US"){
   const token = await getSpotifyToken(env);
-  const params = new URLSearchParams({
-    limit: "1",
-    seed_genres: cleaned.slice(0,5).join(","),
-    target_energy: mood.energy.toFixed(2),
-    target_valence: mood.valence.toFixed(2),
-    min_popularity: "40"
-  });
-  const url = `https://api.spotify.com/v1/recommendations?${params}`;
-  const r = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+  const genres = Array.from(new Set((seeds || []).map(normalizeGenre)));
+  const yearNow = new Date().getUTCFullYear();
+  const qParts = [];
+  if (genres.length) qParts.push(genres.map(g => `genre:"${g}"`).join(" OR "));
+  qParts.push(`year:${yearNow-10}-${yearNow}`);
+  const q = qParts.join(" ");
+  const params = new URLSearchParams({ q, type: "track", market, limit: "30" });
+  const r = await fetch(`https://api.spotify.com/v1/search?${params}`, { headers: { Authorization: `Bearer ${token}` } });
   const txt = await r.text();
-  if (!r.ok) throw new Error(`SPOTIFY_RECS_FAILED ${r.status}: ${txt}`);
+  if (!r.ok) throw new Error(`SPOTIFY_SEARCH_FAILED ${r.status}: ${txt}`);
   const j = JSON.parse(txt);
-  const t = j.tracks?.[0];
-  if (!t) return null;
-  return {
-    id: t.id,
-    name: t.name,
-    artists: (t.artists || []).map(a => a.name).join(", "),
-    url: `https://open.spotify.com/track/${t.id}`,
-    preview_url: t.preview_url
-  };
+  const tracks = j.tracks?.items || [];
+  if (!tracks.length) return null;
+  try {
+    const ids = tracks.slice(0, 50).map(t => t.id).join(",");
+    const rf = await fetch(`https://api.spotify.com/v1/audio-features?ids=${ids}`, { headers: { Authorization: `Bearer ${token}` } });
+    const jf = await rf.json();
+    const feats = jf.audio_features || [];
+    let best = null, bestScore = Infinity;
+    for (let i = 0; i < feats.length; i++) {
+      const f = feats[i]; if (!f) continue;
+      const score = Math.hypot((f.energy - mood.energy), (f.valence - mood.valence), ((f.danceability ?? 0.5) - (mood.danceability ?? 0.5)));
+      if (score < bestScore) { bestScore = score; best = tracks[i]; }
+    }
+    if (best) return { id: best.id, name: best.name, artists: (best.artists || []).map(a => a.name).join(", "), url: `https://open.spotify.com/track/${best.id}`, preview_url: best.preview_url };
+  } catch {}
+  const t = tracks[0];
+  return { id: t.id, name: t.name, artists: (t.artists || []).map(a => a.name).join(", "), url: `https://open.spotify.com/track/${t.id}`, preview_url: t.preview_url };
+}
+async function recommendTrack(env, mood, seeds, market = "US"){
+  try {
+    const avail = await getAvailableGenres(env);
+    const clean = Array.from(new Set((seeds || []).map(normalizeGenre).filter(g => avail.has(g))));
+    const seedGenres = (clean.length ? clean : ["pop","rock","dance"]).slice(0,5).join(",");
+    const token = await getSpotifyToken(env);
+    const params = new URLSearchParams({
+      limit: "1",
+      seed_genres: seedGenres,
+      target_energy: mood.energy.toFixed(2),
+      target_valence: mood.valence.toFixed(2),
+      min_popularity: "40",
+      market
+    });
+    const url = `https://api.spotify.com/v1/recommendations?${params}`;
+    const r = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+    const txt = await r.text();
+    if (r.status === 404) throw new Error("RECS_DEPRECATED");
+    if (!r.ok) throw new Error(`SPOTIFY_RECS_FAILED ${r.status}: ${txt}`);
+    const j = JSON.parse(txt);
+    const t = j.tracks?.[0];
+    if (t) return { id: t.id, name: t.name, artists: (t.artists || []).map(a => a.name).join(", "), url: `https://open.spotify.com/track/${t.id}`, preview_url: t.preview_url };
+  } catch {}
+  return await searchTrackByMood(env, mood, seeds, market);
 }
 
-// ── Helpers de respuesta
 function json(data, init = {}){
   return new Response(JSON.stringify(data, null, 2), {
     headers: {
@@ -225,8 +251,7 @@ function html(){
 <style>
   :root { color-scheme: dark; }
   html,body{height:100%}
-  body{margin:0;background:#000;color:#fff;display:grid;place-items:center;
-       font: clamp(18px, 2.5vw, 28px)/1.3 system-ui,-apple-system,Segoe UI,Roboto,Inter,sans-serif;}
+  body{margin:0;background:#000;color:#fff;display:grid;place-items:center;font: clamp(18px, 2.5vw, 28px)/1.3 system-ui,-apple-system,Segoe UI,Roboto,Inter,sans-serif;}
   .center{ text-align:center; }
 </style>
 <div class="center" id="msg">1. Analizando clima</div>
@@ -272,6 +297,8 @@ export default {
   async fetch(req, env){
     const url = new URL(req.url);
     const { pathname, searchParams } = url;
+    const cfCountry = req.cf?.country;
+    const market = /^[A-Z]{2}$/.test(cfCountry || '') ? cfCountry : 'US';
 
     if (pathname === "/") return html();
 
@@ -298,12 +325,10 @@ export default {
         const feat = featuresFromWeather(cw);
         const mood = inferMood(feat);
         const seeds = pickSeeds(mood.energy, mood.valence, feat.bucket, feat.tempC);
-        const track = await recommendTrack(env, mood, seeds);
-        if (!track) return json({ error: "Sin recomendaciones de Spotify (0 tracks)", weather: cw, features: mood, seeds }, { status: 502 });
-
+        const track = await recommendTrack(env, mood, seeds, market);
+        if (!track) return json({ error: "Sin recomendaciones", weather: cw, features: mood, seeds }, { status: 502 });
         const buckets = ["despejado","nublado","niebla","lluvia","nieve","tormenta"];
         const summary = buckets[feat.bucket] + " \u2022 " + (cw.is_day ? "día" : "noche");
-
         const payload = { weather: { ...cw, summary }, features: mood, seeds, track };
         return json(debug ? { debug: true, ...payload } : payload);
       } catch (err){
@@ -319,7 +344,7 @@ export default {
         const feat = featuresFromWeather(cw);
         const mood = inferMood(feat);
         const seeds = pickSeeds(mood.energy, mood.valence, feat.bucket, feat.tempC);
-        const track = await recommendTrack(env, mood, seeds);
+        const track = await recommendTrack(env, mood, seeds, market);
         const loc = track ? track.url : "https://open.spotify.com/";
         return Response.redirect(loc, 302);
       } catch {
