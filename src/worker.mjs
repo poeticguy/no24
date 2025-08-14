@@ -32,6 +32,38 @@ const clamp = (v, min, max) => Math.min(max, Math.max(min, v));
 const normalizeGenre = s => s.toLowerCase().replace(/\s+/g,'-').replace(/[^a-z0-9-]/g,'');
 const banned = new Set(["reggaeton","latin","salsa","cumbia","regional-mexicano","banda","banda-ms","hip-hop","rap","trap","metal","punk"]);
 
+const __recent = new Map(); // key -> { ids: string[], artists: string[], ts: number }
+
+function recentKey(req, lat, lon){
+  const cc   = req.cf?.country || 'XX';
+  const city = (req.cf?.city || 'X').toLowerCase();
+  return `${cc}:${city}:${Math.round(lat*10)},${Math.round(lon*10)}`;
+}
+
+function getRecents(key){
+  const e = __recent.get(key);
+  if (!e || (Date.now() - e.ts) > 6*60*60*1000) { // 6h
+    return { ids: new Set(), artists: new Set() };
+  }
+  return { ids: new Set(e.ids), artists: new Set(e.artists) };
+}
+
+function pushRecent(key, track){
+  if (!track) return;
+  const e = __recent.get(key) || { ids: [], artists: [], ts: Date.now() };
+  if (track.id) e.ids.unshift(track.id);
+  if (track.artists) {
+    String(track.artists).split(",").forEach(n => {
+      const name = n.trim().toLowerCase();
+      if (name) e.artists.unshift(name);
+    });
+  }
+  e.ids     = Array.from(new Set(e.ids)).slice(0, 50);
+  e.artists = Array.from(new Set(e.artists)).slice(0, 50);
+  e.ts = Date.now();
+  __recent.set(key, e);
+}
+
 function wmoToBucket(code){
   if (code === 0) return 0;
   if ([1,2,3].includes(code)) return 1;
@@ -312,7 +344,7 @@ async function filterByArtistGenres(env, candidates){
   const token = await getSpotifyToken(env);
   const artistIds = Array.from(new Set(candidates.flatMap(t => (t.artists||[]).map(a=>a.id)).filter(Boolean))).slice(0,50);
   if (!artistIds.length) return candidates;
-  const r = await fetch(`https://api.spotify.com/v1/artists?ids=${artistIds.join(",")}`, { headers: { Authorization: { toString(){ return `Bearer ${token}`; } } } }); // small trick to avoid minifiers changing header key
+  const r = await fetch(`https://api.spotify.com/v1/artists?ids=${artistIds.join(",")}`, { headers: { Authorization: { toString(){ return `Bearer ${token}`; } } } });
   let ok = false, j=null;
   if (!r.ok){
     const r2 = await fetch(`https://api.spotify.com/v1/artists?ids=${artistIds.join(",")}`, { headers: { Authorization: `Bearer ${token}` } });
@@ -336,13 +368,14 @@ async function enrichAudioFeatures(env, tracks){
   const amap = new Map((j.audio_features||[]).filter(Boolean).map(f=>[f.id,f]));
   return tracks.map(t => ({ ...t, af: amap.get(t.id)||null }));
 }
-
-function scoreAscending(rand, t, mood){
+function scoreAscending(rand, t, mood, recent){
   const now = Date.now();
   const rel = t.album_release ? (now - t.album_release.getTime())/86400000 : 9999;
   const recency = Math.exp(-rel/90);
+
   const pop = typeof t.popularity === "number" ? t.popularity : 50;
   const popScore = (pop >= 30 && pop <= 70) ? 1 : (pop < 30 ? 0.85 : 0.6);
+
   let afScore = 0.6;
   if (t.af){
     const dE = Math.abs((t.af.energy ?? 0.5) - mood.energy);
@@ -351,25 +384,53 @@ function scoreAscending(rand, t, mood){
     const dD = Math.abs((t.af.danceability ?? 0.5) - targetDance);
     afScore = 1 - Math.min(1, (dE*0.45 + dV*0.45 + dD*0.35));
   }
+
+  const names = (t.artists||[]).map(a => (a.name||'').toLowerCase());
+  const isRepeatArtist = recent && names.some(n => recent.artists.has(n));
+  const isRepeatTrack  = recent && recent.ids && recent.ids.has(t.id);
+  const repeatPenalty = (isRepeatArtist ? 0.22 : 0) + (isRepeatTrack ? 0.35 : 0);
+
   const serendipity = 0.25 + rand()*0.25;
-  const noise = (rand()*2-1) * 0.05;
-  const score = recency*0.45 + popScore*0.25 + afScore*0.30 + serendipity*noise;
+  const noise = (rand()*2-1) * 0.07;
+
+  const score = recency*0.38 + popScore*0.18 + afScore*0.34 + (serendipity*noise) - repeatPenalty;
   return score;
 }
 
-async function recommendAscendingTrack(env, rand, mood, fam, terms, market="US"){
-  const candidatesA = await searchAscendingCandidates(env, terms, market, 240, 30);
+async function recommendAscendingTrack(env, rand, mood, fam, terms, market="US", recent=null){
+  const daysBack = 120 + Math.floor(rand()*240); // 4–12 meses
+  const limit    = 30 + Math.floor(rand()*20);   // 30–50
+
+  const candidatesA = await searchAscendingCandidates(env, terms, market, daysBack, limit);
   const newRel = await fetchNewReleaseCandidates(env, market, 30);
   let pool = [...candidatesA, ...newRel];
+
   pool = pool.filter((t,i,self) => t.id && self.findIndex(x=>x.id===t.id)===i);
   pool = await filterByArtistGenres(env, pool);
   pool = await enrichAudioFeatures(env, pool);
   if (!pool.length) return null;
-  const scored = pool.map(t => ({ t, s: scoreAscending(rand, t, mood) }))
-                     .sort((a,b)=>b.s-a.s)
-                     .slice(0, 10 + Math.floor(rand()*10));
-  const pick = scored[Math.floor(rand()*Math.min(scored.length, 8))]?.t || scored[0].t;
-  return { id: pick.id, name: pick.name, artists: (pick.artists||[]).map(a=>a.name).join(", "), url: pick.url, app_uri: pick.app_uri, preview_url: pick.preview_url };
+
+  const rec = recent || { ids: new Set(), artists: new Set() };
+  const scored = pool.map(t => ({ t, s: scoreAscending(rand, t, mood, rec) }))
+                     .sort((a,b)=>b.s-a.s);
+
+  const diversified = scored.filter(x =>
+    !rec.ids.has(x.t.id) &&
+    !(x.t.artists||[]).some(a => rec.artists.has((a.name||'').toLowerCase()))
+  );
+
+  const base = diversified.length ? diversified : scored;
+  const shortlist = base.slice(0, 20 + Math.floor(rand()*10));
+  const pick = shortlist[Math.floor(rand()*Math.min(shortlist.length, 16))]?.t || base[0].t;
+
+  return {
+    id: pick.id,
+    name: pick.name,
+    artists: (pick.artists||[]).map(a=>a.name).join(", "),
+    url: pick.url,
+    app_uri: pick.app_uri,
+    preview_url: pick.preview_url
+  };
 }
 
 function json(data, init = {}){
@@ -558,8 +619,12 @@ export default {
         const mood0 = inferMood(feat);
 
         const doy = dayOfYear(feat.timeISO);
-        const seedVal = (Date.now() ^ Math.floor(lat*1e4) ^ Math.floor(lon*1e4) ^ (feat.hour<<8) ^ (doy<<16)) | 0;
-        const rand = rngSeed(seedVal);
+        const baseSeed = (Math.floor(lat*1e4) ^ Math.floor(lon*1e4) ^ (feat.hour<<8) ^ (doy<<16)) | 0;
+        const saltParam = Number(searchParams.get("salt"));
+        const salt32 = Number.isFinite(saltParam)
+          ? (saltParam | 0)
+          : (crypto.getRandomValues(new Uint32Array(1))[0] | 0);
+        const rand = rngSeed(baseSeed ^ salt32);
 
         let mood = { ...mood0 };
         if (feat.bucket===3 || feat.bucket===2) { mood.energy = clamp(mood.energy-0.1,0,1); mood.valence = clamp(mood.valence-0.05,0,1); }
@@ -576,16 +641,37 @@ export default {
         const neighbor = fams.filter(x=>x!==fam)[Math.floor(rand()*(fams.length-1))];
         const terms = buildTerms(rand, fam, neighbor);
         const seeds = (FAMILY_SEEDS[fam] || []);
-        const cleanSeeds = Array.from(new Set(seeds.map(normalizeGenre).filter(g=>!banned.has(g))));
+        let cleanSeeds = Array.from(new Set(seeds.map(normalizeGenre).filter(g=>!banned.has(g))));
+
+        // Wildcard de géneros (más variedad)
+        try {
+          const genresSet = await getAvailableGenres(env);
+          const all = Array.from(genresSet);
+          if (all.length && rand() < (0.45 + 0.30 * spice)) {
+            const extra = all[Math.floor(rand() * all.length)];
+            if (extra) cleanSeeds.push(extra);
+          }
+        } catch(_) {}
+
         const searchTerms = seedTerms(cleanSeeds.length?cleanSeeds:terms);
 
-        const track = await recommendAscendingTrack(env, rand, mood, fam, searchTerms, market);
+        const key = recentKey(req, lat, lon);
+        const recents = getRecents(key);
+
+        const track = await recommendAscendingTrack(env, rand, mood, fam, searchTerms, market, recents);
         if (!track) return json({ error: "Sin recomendaciones", weather: cw, features: mood, family: fam, terms: searchTerms }, { status: 502 });
+
+        pushRecent(key, track);
 
         const buckets = ["despejado","nublado","niebla","lluvia","nieve","tormenta"];
         const summary = buckets[feat.bucket] + " \u2022 " + (cw.is_day ? "día" : "noche");
 
-        const payload = { weather: { ...cw, summary }, context: { family: fam, terms: searchTerms, market, spice }, features: mood, track: { id: track.id, name: track.name, artists: track.artists, url: track.url, app_uri: track.app_uri, preview_url: track.preview_url } };
+        const payload = {
+          weather: { ...cw, summary },
+          context: { family: fam, terms: searchTerms, market, spice, salt: salt32 },
+          features: mood,
+          track: { id: track.id, name: track.name, artists: track.artists, url: track.url, app_uri: track.app_uri, preview_url: track.preview_url }
+        };
         return json(debug ? { debug: true, ...payload } : payload);
       } catch (err){
         return json({ error: String(err?.message || err), stack: debug ? (err?.stack || null) : undefined }, { status: 500 });
@@ -600,9 +686,15 @@ export default {
         const cw   = await fetchWeather(env, lat, lon);
         const feat = featuresFromWeather(cw);
         const mood0 = inferMood(feat);
+
         const doy = dayOfYear(feat.timeISO);
-        const seedVal = (Date.now() ^ Math.floor(lat*1e4) ^ Math.floor(lon*1e4) ^ (feat.hour<<8) ^ (doy<<16)) | 0;
-        const rand = rngSeed(seedVal);
+        const baseSeed = (Math.floor(lat*1e4) ^ Math.floor(lon*1e4) ^ (feat.hour<<8) ^ (doy<<16)) | 0;
+        const saltParam = Number(searchParams.get("salt"));
+        const salt32 = Number.isFinite(saltParam)
+          ? (saltParam | 0)
+          : (crypto.getRandomValues(new Uint32Array(1))[0] | 0);
+        const rand = rngSeed(baseSeed ^ salt32);
+
         let mood = { ...mood0 };
         if (feat.bucket===3 || feat.bucket===2) { mood.energy = clamp(mood.energy-0.1,0,1); mood.valence = clamp(mood.valence-0.05,0,1); }
         if (feat.hour>=6 && feat.hour<12) { mood.valence = clamp(mood.valence+0.1,0,1); }
@@ -610,6 +702,7 @@ export default {
         const spice = Number.isFinite(spiceParam) ? clamp(spiceParam, 0, 1) : 0.35;
         mood.energy = clamp(mood.energy + (rand()*2-1)*0.1*spice, 0, 1);
         mood.valence = clamp(mood.valence + (rand()*2-1)*0.1*spice, 0, 1);
+
         const ctx = { hour: feat.hour, weekend: [5,6,0].includes(new Date(feat.timeISO).getUTCDay()), lat, lon };
         const weights = contextWeights(ctx, feat, mood);
         const fams = Object.keys(weights);
@@ -617,12 +710,35 @@ export default {
         const neighbor = ["chill","jazz","brightpop","groove","acoustic","soul"].filter(x=>x!==fam)[Math.floor(rand()*5)];
         const terms = buildTerms(rand, fam, neighbor);
         const seeds = (FAMILY_SEEDS[fam] || []);
-        const cleanSeeds = Array.from(new Set(seeds.map(normalizeGenre).filter(g=>!banned.has(g))));
+        let cleanSeeds = Array.from(new Set(seeds.map(normalizeGenre).filter(g=>!banned.has(g))));
+        try {
+          const genresSet = await getAvailableGenres(env);
+          const all = Array.from(genresSet);
+          if (all.length && rand() < (0.45 + 0.30 * spice)) {
+            const extra = all[Math.floor(rand() * all.length)];
+            if (extra) cleanSeeds.push(extra);
+          }
+        } catch(_) {}
         const searchTerms = seedTerms(cleanSeeds.length?cleanSeeds:terms);
-        const track = await recommendAscendingTrack(env, rand, mood, fam, searchTerms, /^[A-Z]{2}$/.test(req.cf?.country||"")?req.cf.country:"US");
-        const target = track ? `spotify://track/${track.id}` : "https://open.spotify.com/";
-        return Response.redirect(target, 302);
-      } catch { return Response.redirect("https://open.spotify.com/", 302); }
+
+        const key = recentKey(req, lat, lon);
+        const recents = getRecents(key);
+
+        const track = await recommendAscendingTrack(
+          env, rand, mood, fam, searchTerms,
+          /^[A-Z]{2}$/.test(req.cf?.country||"")?req.cf.country:"US",
+          recents
+        );
+
+        if (track) {
+          pushRecent(key, track);
+          const target = `spotify://track/${track.id}`;
+          return Response.redirect(target, 302);
+        }
+        return Response.redirect("https://open.spotify.com/", 302);
+      } catch {
+        return Response.redirect("https://open.spotify.com/", 302);
+      }
     }
 
     return new Response("Not found", { status: 404 });
