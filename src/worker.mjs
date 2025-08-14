@@ -280,7 +280,7 @@ async function fetchNewReleaseCandidates(env, market, limit=30){
   const byId = new Map((jt.tracks||[]).map(x=>[x.id,x]));
   return slice.map(t => {
     const full = byId.get(t.id);
-    return full ? { ...t, popularity: full.popularity, preview_url: full.preview_url, url: `https://open.spotify.com/track/${t.id}` } : t;
+    return full ? { ...t, popularity: full.popularity, preview_url: full.preview_url, url: `https://open.spotify.com/track/${t.id}`, app_uri: `spotify://track/${t.id}` } : t;
   });
 }
 
@@ -303,7 +303,8 @@ async function searchAscendingCandidates(env, terms, market, daysBack=240, limit
     album_release: parseReleaseDate(t.album?.release_date, t.album?.release_date_precision),
     popularity: t.popularity,
     preview_url: t.preview_url,
-    url: `https://open.spotify.com/track/${t.id}`
+    url: `https://open.spotify.com/track/${t.id}`,
+    app_uri: `spotify://track/${t.id}`
   }));
 }
 
@@ -311,9 +312,13 @@ async function filterByArtistGenres(env, candidates){
   const token = await getSpotifyToken(env);
   const artistIds = Array.from(new Set(candidates.flatMap(t => (t.artists||[]).map(a=>a.id)).filter(Boolean))).slice(0,50);
   if (!artistIds.length) return candidates;
-  const r = await fetch(`https://api.spotify.com/v1/artists?ids=${artistIds.join(",")}`, { headers: { Authorization: `Bearer ${token}` } });
-  if (!r.ok) return candidates;
-  const j = await r.json();
+  const r = await fetch(`https://api.spotify.com/v1/artists?ids=${artistIds.join(",")}`, { headers: { Authorization: { toString(){ return `Bearer ${token}`; } } } }); // small trick to avoid minifiers changing header key
+  let ok = false, j=null;
+  if (!r.ok){
+    const r2 = await fetch(`https://api.spotify.com/v1/artists?ids=${artistIds.join(",")}`, { headers: { Authorization: `Bearer ${token}` } });
+    ok = r2.ok; j = ok ? await r2.json() : null;
+  } else { ok = true; j = await r.json(); }
+  if (!ok) return candidates;
   const gmap = new Map((j.artists||[]).map(a => [a.id, a.genres||[]]));
   return candidates.filter(t => {
     const gs = [].concat(...(t.artists||[]).map(a => gmap.get(a.id)||[]));
@@ -364,7 +369,7 @@ async function recommendAscendingTrack(env, rand, mood, fam, terms, market="US")
                      .sort((a,b)=>b.s-a.s)
                      .slice(0, 10 + Math.floor(rand()*10));
   const pick = scored[Math.floor(rand()*Math.min(scored.length, 8))]?.t || scored[0].t;
-  return { id: pick.id, name: pick.name, artists: (pick.artists||[]).map(a=>a.name).join(", "), url: pick.url, preview_url: pick.preview_url };
+  return { id: pick.id, name: pick.name, artists: (pick.artists||[]).map(a=>a.name).join(", "), url: pick.url, app_uri: pick.app_uri, preview_url: pick.preview_url };
 }
 
 function json(data, init = {}){
@@ -467,13 +472,25 @@ function html(){
       u.search = new URLSearchParams({ lat: pos.lat, lon: pos.lon, spice: '0.35' }).toString();
       var r = await fetch(u.toString());
       var j = await r.json();
-      if(!r.ok || !j || !j.track || !j.track.url) throw new Error(j && j.error || 'Sin canción');
+      if(!r.ok || !j || !j.track || !j.track.id) throw new Error(j && j.error || 'Sin canción');
+
+      var appUri = j.track.app_uri || ('spotify://track/' + j.track.id);
+      var webUrl = j.track.url || ('https://open.spotify.com/track/' + j.track.id);
 
       for (var n = 3; n >= 1; n--) {
         setStep('3. Abriendo Spotify en ' + n);
         await sleep(1000);
       }
-      location.replace(j.track.url);
+
+      var didOpen = false;
+      var vis = function(){ if (document.hidden) didOpen = true; };
+      document.addEventListener('visibilitychange', vis, { once:true });
+
+      var fallback = setTimeout(function(){
+        if (!didOpen) location.replace(webUrl);
+      }, 1800);
+
+      location.href = appUri;
     } catch(e){
       step.textContent = 'No pude obtener ubicación o canción. Revisa permisos y recarga.';
       info.textContent = '';
@@ -568,7 +585,7 @@ export default {
         const buckets = ["despejado","nublado","niebla","lluvia","nieve","tormenta"];
         const summary = buckets[feat.bucket] + " \u2022 " + (cw.is_day ? "día" : "noche");
 
-        const payload = { weather: { ...cw, summary }, context: { family: fam, terms: searchTerms, market, spice }, features: mood, track };
+        const payload = { weather: { ...cw, summary }, context: { family: fam, terms: searchTerms, market, spice }, features: mood, track: { id: track.id, name: track.name, artists: track.artists, url: track.url, app_uri: track.app_uri, preview_url: track.preview_url } };
         return json(debug ? { debug: true, ...payload } : payload);
       } catch (err){
         return json({ error: String(err?.message || err), stack: debug ? (err?.stack || null) : undefined }, { status: 500 });
@@ -603,8 +620,8 @@ export default {
         const cleanSeeds = Array.from(new Set(seeds.map(normalizeGenre).filter(g=>!banned.has(g))));
         const searchTerms = seedTerms(cleanSeeds.length?cleanSeeds:terms);
         const track = await recommendAscendingTrack(env, rand, mood, fam, searchTerms, /^[A-Z]{2}$/.test(req.cf?.country||"")?req.cf.country:"US");
-        const loc = track ? track.url : "https://open.spotify.com/";
-        return Response.redirect(loc, 302);
+        const target = track ? `spotify://track/${track.id}` : "https://open.spotify.com/";
+        return Response.redirect(target, 302);
       } catch { return Response.redirect("https://open.spotify.com/", 302); }
     }
 
