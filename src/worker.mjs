@@ -538,7 +538,7 @@ function html(){
       var tC = m && typeof m.temperature === 'number' ? Math.round(m.temperature) + '°C' : '';
       var local = formatLocal(m && m.time ? m.time : null, m && m.timezone ? m.timezone : (pos.tz || undefined));
 
-      await showOnce('Ciudad: ' + loc + (pos.approx ? ' (aprox.)' : ''), 1400);
+      await showOnce('Ciudad: ' + loc + (pos.aprox ? ' (aprox.)' : ''), 1400);
       await showOnce('Temperatura: ' + tC, 1400);
       await showOnce(local.day + ' • ' + local.time, 1400);
 
