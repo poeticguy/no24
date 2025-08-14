@@ -5,6 +5,7 @@ workers_dev = true
 
 [vars]
 OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
+METNO_UA = "no24.company24/1.0 (contact: m@fereyes.com)"
 
 [[routes]]
 pattern = "no24.fereyes.com/*"

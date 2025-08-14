@@ -24,12 +24,11 @@ const b2 = tf.tensor1d([0.05, 0.05, 0.1]);
 
 const dense1 = tf.layers.dense({ units: 8, activation: "relu", inputShape: [4] });
 const dense2 = tf.layers.dense({ units: 3, activation: "sigmoid" });
-const model = tf.sequential({ layers: [dense1, dense2] });
+const model  = tf.sequential({ layers: [dense1, dense2] });
 dense1.setWeights([W1, b1]);
 dense2.setWeights([W2, b2]);
 
 const clamp = (v, min, max) => Math.min(max, Math.max(min, v));
-
 function wmoToBucket(code){
   if (code === 0) return 0;
   if ([1,2,3].includes(code)) return 1;
@@ -39,7 +38,6 @@ function wmoToBucket(code){
   if ([95,96,99].includes(code)) return 5;
   return 1;
 }
-
 function featuresFromWeather(wx){
   const tempC = wx.temperature;
   const tempNorm = (clamp(tempC, -10, 40) + 10) / 50; // -10..40 → 0..1
@@ -50,20 +48,14 @@ function featuresFromWeather(wx){
   const hourNorm = hour / 23;
   return { tempC, tempNorm, bucket, bucketNorm, isDay, hour, hourNorm };
 }
-
-function inferMood(feat){
-  const x = tf.tensor2d([[feat.tempNorm, feat.hourNorm, feat.bucketNorm, feat.isDay]]);
+function inferMood(f){
+  const x = tf.tensor2d([[f.tempNorm, f.hourNorm, f.bucketNorm, f.isDay]]);
   const [energy, valence, acousticness] = model.predict(x).dataSync();
   x.dispose();
   return { energy, valence, acousticness };
 }
-
 function pickSeeds(energy, valence, bucket, tempC){
-  const hot = tempC >= 28;
-  const cold = tempC <= 10;
-  const rain = bucket === 3;
-  const storm = bucket === 5;
-
+  const hot = tempC >= 28, cold = tempC <= 10, rain = bucket === 3, storm = bucket === 5;
   if (storm) return ["metal","rock","punk"];
   if (rain && valence < 0.5) return ["chill","ambient","acoustic"];
   if (cold && valence < 0.5) return ["acoustic","folk","jazz"];
@@ -73,10 +65,80 @@ function pickSeeds(energy, valence, bucket, tempC){
   if (energy < 0.4 && valence < 0.4) return ["ambient","classical","piano"];
   return ["indie","alt-rock","pop"];
 }
+const normalizeGenre = s => s.toLowerCase().replace(/\s+/g,'-').replace(/[^a-z0-9-]/g,'');
+
+function quantize(n, step = 0.05){ return Math.round(n/step)*step; }
+const WX_TTL_MS = 5 * 60 * 1000;
+const wxMemCache = new Map();
+function wxCacheKey(lat, lon){
+  return `${quantize(lat,0.05).toFixed(2)},${quantize(lon,0.05).toFixed(2)}`;
+}
+function wxCacheGet(k){ const e = wxMemCache.get(k); return e && (Date.now()-e.ts) < WX_TTL_MS ? e.data : null; }
+function wxCachePut(k, d){ wxMemCache.set(k, { ts: Date.now(), data: d }); }
+
+async function fetchWithBackoff(url, init, attempts = 3){
+  for (let i=0;i<attempts;i++){
+    const r = await fetch(url, init);
+    if (r.status !== 429 || i === attempts-1) return r;
+    const wait = (2**i)*500 + Math.random()*250;
+    await new Promise(res => setTimeout(res, wait));
+  }
+}
+
+async function fetchWeatherOpenMeteo(env, lat, lon){
+  const url = new URL(env.OPEN_METEO_URL);
+  url.searchParams.set("latitude", String(lat));
+  url.searchParams.set("longitude", String(lon));
+  url.searchParams.set("current_weather", "true");
+  url.searchParams.set("timezone", "auto");
+  const r = await fetchWithBackoff(url.toString());
+  if (!r.ok) throw new Error(`Open-Meteo: ${r.status} ${await r.text()}`);
+  const j = await r.json();
+  return j.current_weather;
+}
+function symbolToWmoLike(symbol){
+  const s = String(symbol || "").toLowerCase();
+  if (s.includes("thunder")) return 95;
+  if (s.includes("snow") || s.includes("sleet")) return 75;
+  if (s.includes("rain")) return 60;
+  if (s.includes("fog")) return 45;
+  if (s.includes("clearsky")) return 0;
+  return 3;
+}
+async function fetchWeatherMetNo(env, lat, lon){
+  const url = `https://api.met.no/weatherapi/locationforecast/2.0/compact?lat=${lat}&lon=${lon}`;
+  const ua = env.METNO_UA || "no24.app/1.0 (contact: example@example.com)";
+  const r = await fetch(url, { headers: { "User-Agent": ua } });
+  if (!r.ok) throw new Error(`METNO: ${r.status} ${await r.text()}`);
+  const j = await r.json();
+  const ts = j.properties?.timeseries?.[0];
+  if (!ts) throw new Error("METNO: empty timeseries");
+  const temp = ts.data?.instant?.details?.air_temperature;
+  const symbol = ts.data?.next_1_hours?.summary?.symbol_code
+              || ts.data?.next_6_hours?.summary?.symbol_code || "";
+  const weathercode = symbolToWmoLike(symbol);
+  const iso = ts.time || "";
+  const hour = Number(iso.slice(11,13) || 0);
+  const is_day = hour >= 7 && hour < 19 ? 1 : 0;
+  return { temperature: temp, weathercode, is_day, time: iso };
+}
+async function fetchWeather(env, lat, lon){
+  const key = wxCacheKey(lat, lon);
+  const c = wxCacheGet(key);
+  if (c) return c;
+  try {
+    const cw = await fetchWeatherOpenMeteo(env, lat, lon);
+    wxCachePut(key, cw);
+    return cw;
+  } catch(_) { /* fallthrough */ }
+  const cw2 = await fetchWeatherMetNo(env, lat, lon);
+  wxCachePut(key, cw2);
+  return cw2;
+}
 
 async function getSpotifyToken(env){
-  if (globalThis.__spToken && Date.now() < globalThis.__spToken.exp) {
-    return globalThis.__spToken.token;
+  if (!env.SPOTIFY_CLIENT_ID || !env.SPOTIFY_CLIENT_SECRET) {
+    throw new Error("SPOTIFY_SECRETS_MISSING: set SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET");
   }
   const creds = btoa(`${env.SPOTIFY_CLIENT_ID}:${env.SPOTIFY_CLIENT_SECRET}`);
   const res = await fetch("https://accounts.spotify.com/api/token", {
@@ -87,41 +149,36 @@ async function getSpotifyToken(env){
     },
     body: "grant_type=client_credentials"
   });
-  if (!res.ok) throw new Error(`Spotify token failed: ${res.status}`);
-  const data = await res.json();
+  const txt = await res.text();
+  if (!res.ok) throw new Error(`SPOTIFY_TOKEN_FAILED ${res.status}: ${txt}`);
+  const data = JSON.parse(txt);
   globalThis.__spToken = { token: data.access_token, exp: Date.now() + (data.expires_in - 60) * 1000 };
   return data.access_token;
 }
-
 async function getAvailableGenres(env){
   if (globalThis.__genres && (Date.now() - globalThis.__genres.ts) < 3600_000) {
     return globalThis.__genres.list;
   }
-  const token = await getSpotifyToken(env);
-  const r = await fetch("https://api.spotify.com/v1/recommendations/available-genre-seeds", {
-    headers: { Authorization: `Bearer ${token}` }
-  });
-  if (!r.ok) throw new Error(`Spotify genres: ${r.status}`);
-  const j = await r.json();
-  const list = new Set(j.genres || []);
+  let list = null;
+  try {
+    const token = await getSpotifyToken(env);
+    const r = await fetch("https://api.spotify.com/v1/recommendations/available-genre-seeds", {
+      headers: { Authorization: `Bearer ${token}` }
+    });
+    if (r.ok) {
+      const j = await r.json();
+      list = new Set(j.genres || []);
+    }
+  } catch {}
+  if (!list) {
+    list = new Set(["pop","rock","dance","edm","latin","reggaeton","indie","alt-rock","jazz","ambient","classical","acoustic","hip-hop","r-n-b","metal","punk","bossanova","chill","folk","piano"]);
+  }
   globalThis.__genres = { list, ts: Date.now() };
   return list;
 }
-
-function normalizeGenre(s){
-  return s.toLowerCase().replace(/\s+/g,'-').replace(/[^a-z0-9-]/g,'');
-}
-
 async function recommendTrack(env, mood, seeds){
-  let avail;
-  try {
-    avail = await getAvailableGenres(env);
-  } catch {
-    avail = new Set(["pop","rock","dance","edm","latin","reggaeton","indie","alt-rock","jazz","ambient","classical","acoustic","hip-hop","r-n-b"]);
-  }
-  let cleaned = Array.from(new Set(
-    (seeds || []).map(normalizeGenre).filter(g => avail.has(g))
-  ));
+  const avail = await getAvailableGenres(env);
+  let cleaned = Array.from(new Set((seeds || []).map(normalizeGenre).filter(g => avail.has(g))));
   if (cleaned.length === 0) cleaned = ["pop","rock","dance"];
 
   const token = await getSpotifyToken(env);
@@ -132,14 +189,11 @@ async function recommendTrack(env, mood, seeds){
     target_valence: mood.valence.toFixed(2),
     min_popularity: "40"
   });
-  const r = await fetch(`https://api.spotify.com/v1/recommendations?${params}`, {
-    headers: { Authorization: `Bearer ${token}` }
-  });
-  if (!r.ok) {
-    const txt = await r.text();
-    throw new Error(`Spotify recs: ${r.status} ${txt}`);
-  }
-  const j = await r.json();
+  const url = `https://api.spotify.com/v1/recommendations?${params}`;
+  const r = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+  const txt = await r.text();
+  if (!r.ok) throw new Error(`SPOTIFY_RECS_FAILED ${r.status}: ${txt}`);
+  const j = JSON.parse(txt);
   const t = j.tracks?.[0];
   if (!t) return null;
   return {
@@ -151,17 +205,7 @@ async function recommendTrack(env, mood, seeds){
   };
 }
 
-async function fetchWeather(env, lat, lon){
-  const url = new URL(env.OPEN_METEO_URL);
-  url.searchParams.set("latitude", String(lat));
-  url.searchParams.set("longitude", String(lon));
-  url.searchParams.set("current_weather", "true");
-  url.searchParams.set("timezone", "auto");
-  const r = await fetch(url.toString());
-  if (!r.ok) throw new Error(`Open-Meteo: ${r.status}`);
-  return (await r.json()).current_weather;
-}
-
+// ── Helpers de respuesta
 function json(data, init = {}){
   return new Response(JSON.stringify(data, null, 2), {
     headers: {
@@ -177,14 +221,12 @@ function html(){
 <html lang="es">
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
-<title>Spotify Weather Redirector</title>
+<title>no24</title>
 <style>
   :root { color-scheme: dark; }
   html,body{height:100%}
-  body{
-    margin:0;background:#000;color:#fff;display:grid;place-items:center;
-    font: clamp(18px, 2.5vw, 28px)/1.3 system-ui,-apple-system,Segoe UI,Roboto,Inter,sans-serif;
-  }
+  body{margin:0;background:#000;color:#fff;display:grid;place-items:center;
+       font: clamp(18px, 2.5vw, 28px)/1.3 system-ui,-apple-system,Segoe UI,Roboto,Inter,sans-serif;}
   .center{ text-align:center; }
 </style>
 <div class="center" id="msg">1. Analizando clima</div>
@@ -192,7 +234,6 @@ function html(){
 (function(){
   var msg = document.getElementById('msg');
   function set(t){ msg.textContent = t; }
-
   function getPos(){
     return new Promise(function(resolve, reject){
       navigator.geolocation.getCurrentPosition(
@@ -202,14 +243,10 @@ function html(){
       );
     });
   }
-
   (async function run(){
     try{
-      // Paso 1
       set('1. Analizando clima');
       var pos = await getPos();
-
-      // Paso 2
       set('2. Consiguiendo una canción');
       var u = new URL(location.href);
       u.pathname = '/api/track';
@@ -217,8 +254,6 @@ function html(){
       var r = await fetch(u.toString());
       var j = await r.json();
       if(!r.ok || !j || !j.track || !j.track.url) throw new Error(j && j.error || 'Sin canción');
-
-      // Paso 3 (contador 3,2,1)
       for (var n = 3; n >= 1; n--) {
         set('3. Redireccionando en ' + n);
         await new Promise(function(res){ setTimeout(res, 1000); });
@@ -240,37 +275,39 @@ export default {
 
     if (pathname === "/") return html();
 
+    if (pathname === "/api/ping"){
+      try {
+        const lat = Number(searchParams.get("lat") || 0);
+        const lon = Number(searchParams.get("lon") || 0);
+        const cw = (Number.isFinite(lat) && Number.isFinite(lon)) ? await fetchWeather(env, lat, lon) : { ok: true };
+        return json({ ok: true, weather: cw });
+      } catch (e) {
+        return json({ ok: false, error: String(e?.message || e) }, { status: 500 });
+      }
+    }
+
     if (pathname === "/api/track"){
+      const debug = searchParams.get("debug") === "1";
       try{
         const lat = Number(searchParams.get("lat"));
         const lon = Number(searchParams.get("lon"));
         if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
           return json({ error: "lat/lon requeridos" }, { status: 400 });
         }
-        const cw = await fetchWeather(env, lat, lon);
+        const cw   = await fetchWeather(env, lat, lon);
         const feat = featuresFromWeather(cw);
         const mood = inferMood(feat);
         const seeds = pickSeeds(mood.energy, mood.valence, feat.bucket, feat.tempC);
         const track = await recommendTrack(env, mood, seeds);
-        if (!track) return json({ error: "Sin recomendaciones" }, { status: 502 });
+        if (!track) return json({ error: "Sin recomendaciones de Spotify (0 tracks)", weather: cw, features: mood, seeds }, { status: 502 });
 
         const buckets = ["despejado","nublado","niebla","lluvia","nieve","tormenta"];
         const summary = buckets[feat.bucket] + " \u2022 " + (cw.is_day ? "día" : "noche");
 
-        return json({
-          weather: {
-            temperature: cw.temperature,
-            weathercode: cw.weathercode,
-            is_day: cw.is_day,
-            time: cw.time,
-            summary
-          },
-          features: mood,
-          seeds,
-          track
-        });
+        const payload = { weather: { ...cw, summary }, features: mood, seeds, track };
+        return json(debug ? { debug: true, ...payload } : payload);
       } catch (err){
-        return json({ error: String(err?.message || err) }, { status: 500 });
+        return json({ error: String(err?.message || err), stack: debug ? (err?.stack || null) : undefined }, { status: 500 });
       }
     }
 
@@ -278,7 +315,7 @@ export default {
       try{
         const lat = Number(searchParams.get("lat"));
         const lon = Number(searchParams.get("lon"));
-        const cw = await fetchWeather(env, lat, lon);
+        const cw   = await fetchWeather(env, lat, lon);
         const feat = featuresFromWeather(cw);
         const mood = inferMood(feat);
         const seeds = pickSeeds(mood.energy, mood.valence, feat.bucket, feat.tempC);
