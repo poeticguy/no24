@@ -1,0 +1,7 @@
+name = "no24"
+main = "src/worker.mjs"
+compatibility_date = "2025-08-14"
+workers_dev = true
+
+[vars]
+OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
