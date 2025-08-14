@@ -64,16 +64,15 @@ function pickSeeds(energy, valence, bucket, tempC){
   const rain = bucket === 3;
   const storm = bucket === 5;
 
-  if (storm) return ["metal", "rock", "punk"];
-  if (rain && valence < 0.5) return ["lo-fi", "ambient", "chill"];
-  if (cold && valence < 0.5) return ["acoustic", "folk", "singer-songwriter"];
-  if (hot && energy > 0.6) return ["latin", "dance", "reggaeton"];
-  if (energy > 0.7 && valence > 0.6) return ["pop", "dance", "edm"];
-  if (energy < 0.4 && valence > 0.6) return ["bossa-nova", "jazz", "acoustic"];
-  if (energy < 0.4 && valence < 0.4) return ["ambient", "classical", "piano"];
-  return ["indie", "alt-rock", "pop"];
+  if (storm) return ["metal","rock","punk"];
+  if (rain && valence < 0.5) return ["chill","ambient","acoustic"];
+  if (cold && valence < 0.5) return ["acoustic","folk","jazz"];
+  if (hot && energy > 0.6) return ["latin","dance","reggaeton"];
+  if (energy > 0.7 && valence > 0.6) return ["pop","dance","edm"];
+  if (energy < 0.4 && valence > 0.6) return ["bossanova","jazz","acoustic"];
+  if (energy < 0.4 && valence < 0.4) return ["ambient","classical","piano"];
+  return ["indie","alt-rock","pop"];
 }
-
 
 async function getSpotifyToken(env){
   if (globalThis.__spToken && Date.now() < globalThis.__spToken.exp) {
@@ -94,11 +93,41 @@ async function getSpotifyToken(env){
   return data.access_token;
 }
 
+async function getAvailableGenres(env){
+  if (globalThis.__genres && (Date.now() - globalThis.__genres.ts) < 3600_000) {
+    return globalThis.__genres.list;
+  }
+  const token = await getSpotifyToken(env);
+  const r = await fetch("https://api.spotify.com/v1/recommendations/available-genre-seeds", {
+    headers: { Authorization: `Bearer ${token}` }
+  });
+  if (!r.ok) throw new Error(`Spotify genres: ${r.status}`);
+  const j = await r.json();
+  const list = new Set(j.genres || []);
+  globalThis.__genres = { list, ts: Date.now() };
+  return list;
+}
+
+function normalizeGenre(s){
+  return s.toLowerCase().replace(/\s+/g,'-').replace(/[^a-z0-9-]/g,'');
+}
+
 async function recommendTrack(env, mood, seeds){
+  let avail;
+  try {
+    avail = await getAvailableGenres(env);
+  } catch {
+    avail = new Set(["pop","rock","dance","edm","latin","reggaeton","indie","alt-rock","jazz","ambient","classical","acoustic","hip-hop","r-n-b"]);
+  }
+  let cleaned = Array.from(new Set(
+    (seeds || []).map(normalizeGenre).filter(g => avail.has(g))
+  ));
+  if (cleaned.length === 0) cleaned = ["pop","rock","dance"];
+
   const token = await getSpotifyToken(env);
   const params = new URLSearchParams({
     limit: "1",
-    seed_genres: seeds.slice(0,5).join(","),
+    seed_genres: cleaned.slice(0,5).join(","),
     target_energy: mood.energy.toFixed(2),
     target_valence: mood.valence.toFixed(2),
     min_popularity: "40"
@@ -106,7 +135,10 @@ async function recommendTrack(env, mood, seeds){
   const r = await fetch(`https://api.spotify.com/v1/recommendations?${params}`, {
     headers: { Authorization: `Bearer ${token}` }
   });
-  if (!r.ok) throw new Error(`Spotify recs: ${r.status}`);
+  if (!r.ok) {
+    const txt = await r.text();
+    throw new Error(`Spotify recs: ${r.status} ${txt}`);
+  }
   const j = await r.json();
   const t = j.tracks?.[0];
   if (!t) return null;
@@ -149,8 +181,10 @@ function html(){
 <style>
   :root { color-scheme: dark; }
   html,body{height:100%}
-  body{margin:0;background:#000;color:#fff;display:grid;place-items:center;
-       font: clamp(18px, 2.5vw, 28px)/1.3 system-ui,-apple-system,Segoe UI,Roboto,Inter,sans-serif;}
+  body{
+    margin:0;background:#000;color:#fff;display:grid;place-items:center;
+    font: clamp(18px, 2.5vw, 28px)/1.3 system-ui,-apple-system,Segoe UI,Roboto,Inter,sans-serif;
+  }
   .center{ text-align:center; }
 </style>
 <div class="center" id="msg">1. Analizando clima</div>

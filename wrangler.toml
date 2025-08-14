@@ -5,3 +5,7 @@ workers_dev = true
 
 [vars]
 OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
+
+[[routes]]
+pattern = "no24.fereyes.com/*"
+zone_name = "fereyes.com"
