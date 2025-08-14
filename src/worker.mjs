@@ -32,34 +32,42 @@ const clamp = (v, min, max) => Math.min(max, Math.max(min, v));
 const normalizeGenre = s => s.toLowerCase().replace(/\s+/g,'-').replace(/[^a-z0-9-]/g,'');
 const banned = new Set(["reggaeton","latin","salsa","cumbia","regional-mexicano","banda","banda-ms","hip-hop","rap","trap","metal","punk"]);
 
-const __recent = new Map(); // key -> { ids: string[], artists: string[], ts: number }
+const __recent = new Map();
 
-function recentKey(req, lat, lon){
-  const cc   = req.cf?.country || 'XX';
-  const city = (req.cf?.city || 'X').toLowerCase();
-  return `${cc}:${city}:${Math.round(lat*10)},${Math.round(lon*10)}`;
+function recentKey(lat, lon){
+  const latQ = Math.floor(lat*20)/20;
+  const lonQ = Math.floor(lon*20)/20;
+  return `${latQ.toFixed(2)},${lonQ.toFixed(2)}`;
 }
 
 function getRecents(key){
   const e = __recent.get(key);
-  if (!e || (Date.now() - e.ts) > 6*60*60*1000) { // 6h
-    return { ids: new Set(), artists: new Set() };
+  if (!e || (Date.now() - e.ts) > 6*60*60*1000) {
+    return { tids: new Set(), aids: new Set(), anames: new Set() };
   }
-  return { ids: new Set(e.ids), artists: new Set(e.artists) };
+  return {
+    tids:   new Set(e.tids || []),
+    aids:   new Set(e.aids || []),
+    anames: new Set(e.anames || [])
+  };
 }
 
 function pushRecent(key, track){
   if (!track) return;
-  const e = __recent.get(key) || { ids: [], artists: [], ts: Date.now() };
-  if (track.id) e.ids.unshift(track.id);
+  const e = __recent.get(key) || { tids: [], aids: [], anames: [], ts: Date.now() };
+  if (track.id) e.tids.unshift(track.id);
+  if (Array.isArray(track.artist_ids)) {
+    for (const id of track.artist_ids) if (id) e.aids.unshift(id);
+  }
   if (track.artists) {
     String(track.artists).split(",").forEach(n => {
       const name = n.trim().toLowerCase();
-      if (name) e.artists.unshift(name);
+      if (name) e.anames.unshift(name);
     });
   }
-  e.ids     = Array.from(new Set(e.ids)).slice(0, 50);
-  e.artists = Array.from(new Set(e.artists)).slice(0, 50);
+  e.tids   = Array.from(new Set(e.tids)).slice(0, 60);
+  e.aids   = Array.from(new Set(e.aids)).slice(0, 80);
+  e.anames = Array.from(new Set(e.anames)).slice(0, 80);
   e.ts = Date.now();
   __recent.set(key, e);
 }
@@ -368,14 +376,13 @@ async function enrichAudioFeatures(env, tracks){
   const amap = new Map((j.audio_features||[]).filter(Boolean).map(f=>[f.id,f]));
   return tracks.map(t => ({ ...t, af: amap.get(t.id)||null }));
 }
+
 function scoreAscending(rand, t, mood, recent){
   const now = Date.now();
   const rel = t.album_release ? (now - t.album_release.getTime())/86400000 : 9999;
   const recency = Math.exp(-rel/90);
-
   const pop = typeof t.popularity === "number" ? t.popularity : 50;
   const popScore = (pop >= 30 && pop <= 70) ? 1 : (pop < 30 ? 0.85 : 0.6);
-
   let afScore = 0.6;
   if (t.af){
     const dE = Math.abs((t.af.energy ?? 0.5) - mood.energy);
@@ -384,49 +391,57 @@ function scoreAscending(rand, t, mood, recent){
     const dD = Math.abs((t.af.danceability ?? 0.5) - targetDance);
     afScore = 1 - Math.min(1, (dE*0.45 + dV*0.45 + dD*0.35));
   }
-
+  const aids = recent?.aids || new Set();
+  const anames = recent?.anames || new Set();
   const names = (t.artists||[]).map(a => (a.name||'').toLowerCase());
-  const isRepeatArtist = recent && names.some(n => recent.artists.has(n));
-  const isRepeatTrack  = recent && recent.ids && recent.ids.has(t.id);
-  const repeatPenalty = (isRepeatArtist ? 0.22 : 0) + (isRepeatTrack ? 0.35 : 0);
-
+  const hasSeenArtistId   = (t.artists||[]).some(a => a?.id && aids.has(a.id));
+  const hasSeenArtistName = names.some(n => anames.has(n));
+  const repeatPenalty = (hasSeenArtistId ? 0.18 : 0) + (hasSeenArtistName ? 0.08 : 0);
   const serendipity = 0.25 + rand()*0.25;
   const noise = (rand()*2-1) * 0.07;
-
-  const score = recency*0.38 + popScore*0.18 + afScore*0.34 + (serendipity*noise) - repeatPenalty;
-  return score;
+  return recency*0.38 + popScore*0.18 + afScore*0.34 + (serendipity*noise) - repeatPenalty;
 }
 
 async function recommendAscendingTrack(env, rand, mood, fam, terms, market="US", recent=null){
-  const daysBack = 120 + Math.floor(rand()*240); // 4–12 meses
-  const limit    = 30 + Math.floor(rand()*20);   // 30–50
-
+  const daysBack = 120 + Math.floor(rand()*240);
+  const limit    = 30 + Math.floor(rand()*20);
   const candidatesA = await searchAscendingCandidates(env, terms, market, daysBack, limit);
   const newRel = await fetchNewReleaseCandidates(env, market, 30);
   let pool = [...candidatesA, ...newRel];
-
   pool = pool.filter((t,i,self) => t.id && self.findIndex(x=>x.id===t.id)===i);
   pool = await filterByArtistGenres(env, pool);
   pool = await enrichAudioFeatures(env, pool);
   if (!pool.length) return null;
-
-  const rec = recent || { ids: new Set(), artists: new Set() };
-  const scored = pool.map(t => ({ t, s: scoreAscending(rand, t, mood, rec) }))
+  if (recent) {
+    const tids = recent.tids || new Set();
+    const aids = recent.aids || new Set();
+    const anames = recent.anames || new Set();
+    const filtered = pool.filter(t => {
+      if (!t || !t.id) return false;
+      if (tids.has(t.id)) return false;
+      const aObjs = (t.artists || []);
+      const hasRepeatId = aObjs.some(a => a && a.id && aids.has(a.id));
+      if (hasRepeatId) return false;
+      const hasRepeatName = aObjs.some(a => (a?.name||'').trim() && anames.has(a.name.toLowerCase()));
+      if (hasRepeatName) return false;
+      return true;
+    });
+    if (filtered.length >= 5) {
+      pool = filtered;
+    } else {
+      pool = pool.filter(t => !tids.has(t.id));
+    }
+  }
+  const scored = pool.map(t => ({ t, s: scoreAscending(rand, t, mood, recent) }))
                      .sort((a,b)=>b.s-a.s);
-
-  const diversified = scored.filter(x =>
-    !rec.ids.has(x.t.id) &&
-    !(x.t.artists||[]).some(a => rec.artists.has((a.name||'').toLowerCase()))
-  );
-
-  const base = diversified.length ? diversified : scored;
+  const base = scored;
   const shortlist = base.slice(0, 20 + Math.floor(rand()*10));
   const pick = shortlist[Math.floor(rand()*Math.min(shortlist.length, 16))]?.t || base[0].t;
-
   return {
     id: pick.id,
     name: pick.name,
     artists: (pick.artists||[]).map(a=>a.name).join(", "),
+    artist_ids: (pick.artists||[]).map(a=>a.id).filter(Boolean),
     url: pick.url,
     app_uri: pick.app_uri,
     preview_url: pick.preview_url
@@ -621,9 +636,7 @@ export default {
         const doy = dayOfYear(feat.timeISO);
         const baseSeed = (Math.floor(lat*1e4) ^ Math.floor(lon*1e4) ^ (feat.hour<<8) ^ (doy<<16)) | 0;
         const saltParam = Number(searchParams.get("salt"));
-        const salt32 = Number.isFinite(saltParam)
-          ? (saltParam | 0)
-          : (crypto.getRandomValues(new Uint32Array(1))[0] | 0);
+        const salt32 = Number.isFinite(saltParam) ? (saltParam | 0) : (crypto.getRandomValues(new Uint32Array(1))[0] | 0);
         const rand = rngSeed(baseSeed ^ salt32);
 
         let mood = { ...mood0 };
@@ -642,8 +655,6 @@ export default {
         const terms = buildTerms(rand, fam, neighbor);
         const seeds = (FAMILY_SEEDS[fam] || []);
         let cleanSeeds = Array.from(new Set(seeds.map(normalizeGenre).filter(g=>!banned.has(g))));
-
-        // Wildcard de géneros (más variedad)
         try {
           const genresSet = await getAvailableGenres(env);
           const all = Array.from(genresSet);
@@ -652,10 +663,9 @@ export default {
             if (extra) cleanSeeds.push(extra);
           }
         } catch(_) {}
-
         const searchTerms = seedTerms(cleanSeeds.length?cleanSeeds:terms);
 
-        const key = recentKey(req, lat, lon);
+        const key = recentKey(lat, lon);
         const recents = getRecents(key);
 
         const track = await recommendAscendingTrack(env, rand, mood, fam, searchTerms, market, recents);
@@ -670,7 +680,7 @@ export default {
           weather: { ...cw, summary },
           context: { family: fam, terms: searchTerms, market, spice, salt: salt32 },
           features: mood,
-          track: { id: track.id, name: track.name, artists: track.artists, url: track.url, app_uri: track.app_uri, preview_url: track.preview_url }
+          track: { id: track.id, name: track.name, artists: track.artists, artist_ids: track.artist_ids, url: track.url, app_uri: track.app_uri, preview_url: track.preview_url }
         };
         return json(debug ? { debug: true, ...payload } : payload);
       } catch (err){
@@ -690,9 +700,7 @@ export default {
         const doy = dayOfYear(feat.timeISO);
         const baseSeed = (Math.floor(lat*1e4) ^ Math.floor(lon*1e4) ^ (feat.hour<<8) ^ (doy<<16)) | 0;
         const saltParam = Number(searchParams.get("salt"));
-        const salt32 = Number.isFinite(saltParam)
-          ? (saltParam | 0)
-          : (crypto.getRandomValues(new Uint32Array(1))[0] | 0);
+        const salt32 = Number.isFinite(saltParam) ? (saltParam | 0) : (crypto.getRandomValues(new Uint32Array(1))[0] | 0);
         const rand = rngSeed(baseSeed ^ salt32);
 
         let mood = { ...mood0 };
@@ -721,7 +729,7 @@ export default {
         } catch(_) {}
         const searchTerms = seedTerms(cleanSeeds.length?cleanSeeds:terms);
 
-        const key = recentKey(req, lat, lon);
+        const key = recentKey(lat, lon);
         const recents = getRecents(key);
 
         const track = await recommendAscendingTrack(
