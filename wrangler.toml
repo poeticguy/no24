@@ -1,17 +1,7 @@
-{
-  "name": "no24",
-  "version": "1.0.0",
-  "private": true,
-  "type": "module",
-  "scripts": {
-    "dev": "wrangler dev",
-    "publish": "wrangler deploy"
-  },
-  "devDependencies": {
-    "wrangler": "^3.75.0"
-  },
-  "dependencies": {
-    "@tensorflow/tfjs": "^4.20.0",
-    "@tensorflow/tfjs-backend-cpu": "^4.20.0"
-  }
-}
+name = "no24"
+main = "src/worker.mjs"
+compatibility_date = "2025-08-14"
+workers_dev = true
+
+[vars]
+OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
