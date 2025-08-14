@@ -175,37 +175,99 @@ async function getAvailableGenres(env){
   globalThis.__genres = { list, ts: Date.now() };
   return list;
 }
+
+function seedTerms(seeds = []) {
+  const map = {
+    "alt-rock": "alternative rock",
+    "bossanova": "bossa nova",
+    "r-n-b": "r&b",
+    "hip-hop": "hip hop",
+    "lo-fi": "lofi"
+  };
+  return Array.from(new Set(
+    (seeds || []).map(s => (map[s] || s).replace(/-/g, " ")).filter(Boolean)
+  ));
+}
+
 async function searchTrackByMood(env, mood, seeds, market = "US"){
   const token = await getSpotifyToken(env);
-  const genres = Array.from(new Set((seeds || []).map(normalizeGenre)));
+  const terms = seedTerms(seeds);
   const yearNow = new Date().getUTCFullYear();
-  const qParts = [];
-  if (genres.length) qParts.push(genres.map(g => `genre:"${g}"`).join(" OR "));
-  qParts.push(`year:${yearNow-10}-${yearNow}`);
-  const q = qParts.join(" ");
-  const params = new URLSearchParams({ q, type: "track", market, limit: "30" });
-  const r = await fetch(`https://api.spotify.com/v1/search?${params}`, { headers: { Authorization: `Bearer ${token}` } });
-  const txt = await r.text();
-  if (!r.ok) throw new Error(`SPOTIFY_SEARCH_FAILED ${r.status}: ${txt}`);
-  const j = JSON.parse(txt);
-  const tracks = j.tracks?.items || [];
-  if (!tracks.length) return null;
+
+  async function doSearch(q, limit = 30) {
+    const params = new URLSearchParams({ q, type: "track", market, limit: String(limit) });
+    const r = await fetch(`https://api.spotify.com/v1/search?${params}`, {
+      headers: { Authorization: `Bearer ${token}` }
+    });
+    const txt = await r.text();
+    if (!r.ok) throw new Error(`SPOTIFY_SEARCH_FAILED ${r.status}: ${txt}`);
+    const j = JSON.parse(txt);
+    return j.tracks?.items || [];
+  }
+
+  let tracks = [];
+  if (terms.length) {
+    const q1 = `(${terms.map(t => `"${t}"`).join(" OR ")}) year:${yearNow-7}-${yearNow}`;
+    tracks = await doSearch(q1);
+  }
+  if (!tracks.length && terms.length) {
+    const q2 = `(${terms.map(t => `"${t}"`).join(" OR ")})`;
+    tracks = await doSearch(q2);
+  }
+  if (!tracks.length) {
+    const q3 = `year:${yearNow-7}-${yearNow}`;
+    tracks = await doSearch(q3);
+  }
+  if (!tracks.length) {
+    const q4 = `pop`;
+    tracks = await doSearch(q4);
+  }
+  if (!tracks.length) return {
+    id: "4uLU6hMCjMI75M1A2tKUQC",
+    name: "Never Gonna Give You Up",
+    artists: "Rick Astley",
+    url: "https://open.spotify.com/track/4uLU6hMCjMI75M1A2tKUQC",
+    preview_url: null
+  };
+
   try {
     const ids = tracks.slice(0, 50).map(t => t.id).join(",");
-    const rf = await fetch(`https://api.spotify.com/v1/audio-features?ids=${ids}`, { headers: { Authorization: `Bearer ${token}` } });
-    const jf = await rf.json();
-    const feats = jf.audio_features || [];
-    let best = null, bestScore = Infinity;
-    for (let i = 0; i < feats.length; i++) {
-      const f = feats[i]; if (!f) continue;
-      const score = Math.hypot((f.energy - mood.energy), (f.valence - mood.valence), ((f.danceability ?? 0.5) - (mood.danceability ?? 0.5)));
-      if (score < bestScore) { bestScore = score; best = tracks[i]; }
+    const rf = await fetch(`https://api.spotify.com/v1/audio-features?ids=${ids}`, {
+      headers: { Authorization: `Bearer ${token}` }
+    });
+    if (rf.ok) {
+      const jf = await rf.json();
+      const feats = jf.audio_features || [];
+      let best = null, bestScore = Infinity;
+      for (let i = 0; i < feats.length; i++) {
+        const f = feats[i]; if (!f) continue;
+        const score = Math.hypot(
+          (f.energy - mood.energy),
+          (f.valence - mood.valence),
+          ((f.danceability ?? 0.5) - (mood.danceability ?? 0.5))
+        );
+        if (score < bestScore) { bestScore = score; best = tracks[i]; }
+      }
+      if (best) return {
+        id: best.id,
+        name: best.name,
+        artists: (best.artists || []).map(a => a.name).join(", "),
+        url: `https://open.spotify.com/track/${best.id}`,
+        preview_url: best.preview_url
+      };
     }
-    if (best) return { id: best.id, name: best.name, artists: (best.artists || []).map(a => a.name).join(", "), url: `https://open.spotify.com/track/${best.id}`, preview_url: best.preview_url };
   } catch {}
+
   const t = tracks[0];
-  return { id: t.id, name: t.name, artists: (t.artists || []).map(a => a.name).join(", "), url: `https://open.spotify.com/track/${t.id}`, preview_url: t.preview_url };
+  return {
+    id: t.id,
+    name: t.name,
+    artists: (t.artists || []).map(a => a.name).join(", "),
+    url: `https://open.spotify.com/track/${t.id}`,
+    preview_url: t.preview_url
+  };
 }
+
 async function recommendTrack(env, mood, seeds, market = "US"){
   try {
     const avail = await getAvailableGenres(env);
@@ -227,7 +289,13 @@ async function recommendTrack(env, mood, seeds, market = "US"){
     if (!r.ok) throw new Error(`SPOTIFY_RECS_FAILED ${r.status}: ${txt}`);
     const j = JSON.parse(txt);
     const t = j.tracks?.[0];
-    if (t) return { id: t.id, name: t.name, artists: (t.artists || []).map(a => a.name).join(", "), url: `https://open.spotify.com/track/${t.id}`, preview_url: t.preview_url };
+    if (t) return {
+      id: t.id,
+      name: t.name,
+      artists: (t.artists || []).map(a => a.name).join(", "),
+      url: `https://open.spotify.com/track/${t.id}`,
+      preview_url: t.preview_url
+    };
   } catch {}
   return await searchTrackByMood(env, mood, seeds, market);
 }
