@@ -39,37 +39,44 @@ function recentKey(lat, lon){
   const lonQ = Math.floor(lon*20)/20;
   return `${latQ.toFixed(2)},${lonQ.toFixed(2)}`;
 }
-
-function getRecents(key){
+function getRecentsMem(key){
   const e = __recent.get(key);
-  if (!e || (Date.now() - e.ts) > 6*60*60*1000) {
-    return { tids: new Set(), aids: new Set(), anames: new Set() };
-  }
-  return {
-    tids:   new Set(e.tids || []),
-    aids:   new Set(e.aids || []),
-    anames: new Set(e.anames || [])
-  };
+  if (!e || (Date.now() - e.ts) > 6*60*60*1000) return { tids:new Set(), aids:new Set(), anames:new Set() };
+  return { tids:new Set(e.tids||[]), aids:new Set(e.aids||[]), anames:new Set(e.anames||[]) };
 }
-
-function pushRecent(key, track){
-  if (!track) return;
-  const e = __recent.get(key) || { tids: [], aids: [], anames: [], ts: Date.now() };
-  if (track.id) e.tids.unshift(track.id);
-  if (Array.isArray(track.artist_ids)) {
-    for (const id of track.artist_ids) if (id) e.aids.unshift(id);
-  }
-  if (track.artists) {
-    String(track.artists).split(",").forEach(n => {
-      const name = n.trim().toLowerCase();
-      if (name) e.anames.unshift(name);
-    });
-  }
-  e.tids   = Array.from(new Set(e.tids)).slice(0, 60);
-  e.aids   = Array.from(new Set(e.aids)).slice(0, 80);
-  e.anames = Array.from(new Set(e.anames)).slice(0, 80);
+function pushRecentMem(key, track){
+  const e = __recent.get(key) || { tids:[], aids:[], anames:[], ts:Date.now() };
+  if (track?.id) e.tids.unshift(track.id);
+  if (Array.isArray(track?.artist_ids)) for (const id of track.artist_ids) if (id) e.aids.unshift(id);
+  if (track?.artists) String(track.artists).split(",").forEach(n => { const name=n.trim().toLowerCase(); if (name) e.anames.unshift(name); });
+  e.tids = Array.from(new Set(e.tids)).slice(0,60);
+  e.aids = Array.from(new Set(e.aids)).slice(0,80);
+  e.anames = Array.from(new Set(e.anames)).slice(0,80);
   e.ts = Date.now();
   __recent.set(key, e);
+}
+
+function readRecentsCookie(req){
+  const raw = req.headers.get("Cookie") || "";
+  const m = raw.match(/(?:^|;\s*)n24r=([^;]+)/);
+  if (!m) return { tids:new Set(), aids:new Set(), anames:new Set() };
+  try{
+    const val = decodeURIComponent(m[1]);
+    const str = atob(val.replace(/-/g,'+').replace(/_/g,'/'));
+    const obj = JSON.parse(str);
+    if (!obj || typeof obj.ts !== "number" || (Date.now()-obj.ts) > 21600000) return { tids:new Set(), aids:new Set(), anames:new Set() };
+    return { tids:new Set(obj.tids||[]), aids:new Set(obj.aids||[]), anames:new Set(obj.anames||[]) };
+  } catch { return { tids:new Set(), aids:new Set(), anames:new Set() }; }
+}
+function cookieFromRecents(rec){
+  const out = {
+    ts: Date.now(),
+    tids: Array.from(rec.tids).slice(0,20),
+    aids: Array.from(rec.aids).slice(0,30),
+    anames: Array.from(rec.anames).slice(0,30)
+  };
+  const s = btoa(JSON.stringify(out)).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
+  return `n24r=${encodeURIComponent(s)}; Max-Age=21600; Path=/; SameSite=Lax; Secure`;
 }
 
 function wmoToBucket(code){
@@ -164,15 +171,6 @@ function seedTerms(seeds = []) {
   const map = { "alt-rock":"alternative rock","bossanova":"bossa nova","r-n-b":"r&b","hip-hop":"hip hop","lo-fi":"lofi","synth-pop":"synthpop","deep-house":"deep house","indie-pop":"indie pop" };
   return Array.from(new Set((seeds || []).map(s => (map[s] || s).replace(/-/g, " ")).filter(Boolean)));
 }
-function yearWindowForFamily(fam){
-  const y = new Date().getUTCFullYear();
-  if (fam==="jazz" || fam==="soul") return `${y-60}-${y}`;
-  if (fam==="acoustic") return `${y-35}-${y}`;
-  if (fam==="chill") return `${y-20}-${y}`;
-  if (fam==="groove" || fam==="brightpop") return `${y-12}-${y}`;
-  return `${y-20}-${y}`;
-}
-function jitter(rand, v, r){ return clamp(v + (rand()*2-1)*r, 0, 1); }
 
 function quantize(n, step = 0.05){ return Math.round(n/step)*step; }
 const WX_TTL_MS = 5 * 60 * 1000;
@@ -284,7 +282,6 @@ function artistGenresBanned(genres){
   const s = (genres||[]).join(" ").toLowerCase();
   return ["latin","reggaeton","cumbia","salsa","regional","banda","hip hop","rap","trap","metal","punk"].some(x=>s.includes(x));
 }
-
 function parseReleaseDate(iso, precision){
   if (!iso) return null;
   if (precision==="day" || !precision) return new Date(iso+"T12:00:00Z");
@@ -292,7 +289,6 @@ function parseReleaseDate(iso, precision){
   if (precision==="year") return new Date(iso+"-07-01T12:00:00Z");
   return new Date(iso);
 }
-
 async function fetchNewReleaseCandidates(env, market, limit=30){
   const token = await getSpotifyToken(env);
   const r = await fetch(`https://api.spotify.com/v1/browse/new-releases?country=${market}&limit=${limit}`, { headers: { Authorization: `Bearer ${token}` } });
@@ -316,14 +312,13 @@ async function fetchNewReleaseCandidates(env, market, limit=30){
   const tid = slice.map(t=>t.id).join(",");
   const rt = await fetch(`https://api.spotify.com/v1/tracks?ids=${tid}`, { headers: { Authorization: `Bearer ${token}` } });
   if (!rt.ok) return [];
-  const jt = await rt.json();
+  const jt = await r.json();
   const byId = new Map((jt.tracks||[]).map(x=>[x.id,x]));
   return slice.map(t => {
     const full = byId.get(t.id);
     return full ? { ...t, popularity: full.popularity, preview_url: full.preview_url, url: `https://open.spotify.com/track/${t.id}`, app_uri: `spotify://track/${t.id}` } : t;
   });
 }
-
 async function searchAscendingCandidates(env, terms, market, daysBack=240, limit=30){
   const token = await getSpotifyToken(env);
   const yearNow = new Date().getUTCFullYear();
@@ -347,7 +342,6 @@ async function searchAscendingCandidates(env, terms, market, daysBack=240, limit
     app_uri: `spotify://track/${t.id}`
   }));
 }
-
 async function filterByArtistGenres(env, candidates){
   const token = await getSpotifyToken(env);
   const artistIds = Array.from(new Set(candidates.flatMap(t => (t.artists||[]).map(a=>a.id)).filter(Boolean))).slice(0,50);
@@ -365,7 +359,6 @@ async function filterByArtistGenres(env, candidates){
     return !artistGenresBanned(gs);
   });
 }
-
 async function enrichAudioFeatures(env, tracks){
   const token = await getSpotifyToken(env);
   const ids = tracks.map(t=>t.id).slice(0,100).join(",");
@@ -376,7 +369,6 @@ async function enrichAudioFeatures(env, tracks){
   const amap = new Map((j.audio_features||[]).filter(Boolean).map(f=>[f.id,f]));
   return tracks.map(t => ({ ...t, af: amap.get(t.id)||null }));
 }
-
 function scoreAscending(rand, t, mood, recent){
   const now = Date.now();
   const rel = t.album_release ? (now - t.album_release.getTime())/86400000 : 9999;
@@ -401,7 +393,6 @@ function scoreAscending(rand, t, mood, recent){
   const noise = (rand()*2-1) * 0.07;
   return recency*0.38 + popScore*0.18 + afScore*0.34 + (serendipity*noise) - repeatPenalty;
 }
-
 async function recommendAscendingTrack(env, rand, mood, fam, terms, market="US", recent=null){
   const daysBack = 120 + Math.floor(rand()*240);
   const limit    = 30 + Math.floor(rand()*20);
@@ -426,17 +417,12 @@ async function recommendAscendingTrack(env, rand, mood, fam, terms, market="US",
       if (hasRepeatName) return false;
       return true;
     });
-    if (filtered.length >= 5) {
-      pool = filtered;
-    } else {
-      pool = pool.filter(t => !tids.has(t.id));
-    }
+    pool = filtered.length >= 5 ? filtered : pool.filter(t => !tids.has(t.id));
   }
   const scored = pool.map(t => ({ t, s: scoreAscending(rand, t, mood, recent) }))
                      .sort((a,b)=>b.s-a.s);
-  const base = scored;
-  const shortlist = base.slice(0, 20 + Math.floor(rand()*10));
-  const pick = shortlist[Math.floor(rand()*Math.min(shortlist.length, 16))]?.t || base[0].t;
+  const shortlist = scored.slice(0, 20 + Math.floor(rand()*10));
+  const pick = shortlist[Math.floor(rand()*Math.min(shortlist.length, 16))]?.t || scored[0].t;
   return {
     id: pick.id,
     name: pick.name,
@@ -449,7 +435,8 @@ async function recommendAscendingTrack(env, rand, mood, fam, terms, market="US",
 }
 
 function json(data, init = {}){
-  return new Response(JSON.stringify(data, null, 2), { headers: { "content-type": "application/json; charset=utf-8","access-control-allow-origin": "*" }, ...init });
+  const resp = new Response(JSON.stringify(data, null, 2), { headers: { "content-type": "application/json; charset=utf-8","access-control-allow-origin": "*" }, ...init });
+  return resp;
 }
 
 function html(){
@@ -545,7 +532,9 @@ function html(){
       setStep('2. Consiguiendo una canción');
       var u = new URL(location.href);
       u.pathname = '/api/track';
-      u.search = new URLSearchParams({ lat: pos.lat, lon: pos.lon, spice: '0.35' }).toString();
+      var s = new Uint32Array(1); crypto.getRandomValues(s);
+      var salt = (s[0] || Date.now()) >>> 0; if (salt === 0) salt = 1;
+      u.search = new URLSearchParams({ lat: pos.lat, lon: pos.lon, spice: '0.35', salt: String(salt) }).toString();
       var r = await fetch(u.toString());
       var j = await r.json();
       if(!r.ok || !j || !j.track || !j.track.id) throw new Error(j && j.error || 'Sin canción');
@@ -553,19 +542,11 @@ function html(){
       var appUri = j.track.app_uri || ('spotify://track/' + j.track.id);
       var webUrl = j.track.url || ('https://open.spotify.com/track/' + j.track.id);
 
-      for (var n = 3; n >= 1; n--) {
-        setStep('3. Abriendo Spotify en ' + n);
-        await sleep(1000);
-      }
+      for (var n = 3; n >= 1; n--) { setStep('3. Abriendo Spotify en ' + n); await sleep(1000); }
 
       var didOpen = false;
-      var vis = function(){ if (document.hidden) didOpen = true; };
-      document.addEventListener('visibilitychange', vis, { once:true });
-
-      var fallback = setTimeout(function(){
-        if (!didOpen) location.replace(webUrl);
-      }, 1800);
-
+      document.addEventListener('visibilitychange', function(){ if (document.hidden) didOpen = true; }, { once:true });
+      setTimeout(function(){ if (!didOpen) location.replace(webUrl); }, 1800);
       location.href = appUri;
     } catch(e){
       step.textContent = 'No pude obtener ubicación o canción. Revisa permisos y recarga.';
@@ -636,7 +617,12 @@ export default {
         const doy = dayOfYear(feat.timeISO);
         const baseSeed = (Math.floor(lat*1e4) ^ Math.floor(lon*1e4) ^ (feat.hour<<8) ^ (doy<<16)) | 0;
         const saltParam = Number(searchParams.get("salt"));
-        const salt32 = Number.isFinite(saltParam) ? (saltParam | 0) : (crypto.getRandomValues(new Uint32Array(1))[0] | 0);
+        let salt32;
+        if (Number.isFinite(saltParam)) { salt32 = (saltParam | 0) || ((Date.now() & 0xffffffff) | 1); }
+        else {
+          const a = new Uint32Array(1); crypto.getRandomValues(a);
+          salt32 = (a[0] | 0) || ((Date.now() & 0xffffffff) | 1);
+        }
         const rand = rngSeed(baseSeed ^ salt32);
 
         let mood = { ...mood0 };
@@ -655,34 +641,32 @@ export default {
         const terms = buildTerms(rand, fam, neighbor);
         const seeds = (FAMILY_SEEDS[fam] || []);
         let cleanSeeds = Array.from(new Set(seeds.map(normalizeGenre).filter(g=>!banned.has(g))));
-        try {
-          const genresSet = await getAvailableGenres(env);
-          const all = Array.from(genresSet);
-          if (all.length && rand() < (0.45 + 0.30 * spice)) {
-            const extra = all[Math.floor(rand() * all.length)];
-            if (extra) cleanSeeds.push(extra);
-          }
-        } catch(_) {}
+        try { const genresSet = await getAvailableGenres(env); const all = Array.from(genresSet); if (all.length && rand() < (0.45 + 0.30 * spice)) { const extra = all[Math.floor(rand() * all.length)]; if (extra) cleanSeeds.push(extra); } } catch(_){}
         const searchTerms = seedTerms(cleanSeeds.length?cleanSeeds:terms);
 
         const key = recentKey(lat, lon);
-        const recents = getRecents(key);
+        const mem = getRecentsMem(key);
+        const cok = readRecentsCookie(req);
+        const recents = { tids:new Set([...mem.tids, ...cok.tids]), aids:new Set([...mem.aids, ...cok.aids]), anames:new Set([...mem.anames, ...cok.anames]) };
 
         const track = await recommendAscendingTrack(env, rand, mood, fam, searchTerms, market, recents);
         if (!track) return json({ error: "Sin recomendaciones", weather: cw, features: mood, family: fam, terms: searchTerms }, { status: 502 });
 
-        pushRecent(key, track);
+        pushRecentMem(key, track);
+
+        const newRec = { tids:new Set(recents.tids), aids:new Set(recents.aids), anames:new Set(recents.anames) };
+        newRec.tids.add(track.id);
+        (track.artist_ids||[]).forEach(id => newRec.aids.add(id));
+        String(track.artists||"").split(",").map(s=>s.trim().toLowerCase()).filter(Boolean).forEach(n=>newRec.anames.add(n));
+        const cookie = cookieFromRecents(newRec);
 
         const buckets = ["despejado","nublado","niebla","lluvia","nieve","tormenta"];
-        const summary = buckets[feat.bucket] + " \u2022 " + (cw.is_day ? "día" : "noche");
+        const summary = buckets[feat.bucket] + " • " + (cw.is_day ? "día" : "noche");
 
-        const payload = {
-          weather: { ...cw, summary },
-          context: { family: fam, terms: searchTerms, market, spice, salt: salt32 },
-          features: mood,
-          track: { id: track.id, name: track.name, artists: track.artists, artist_ids: track.artist_ids, url: track.url, app_uri: track.app_uri, preview_url: track.preview_url }
-        };
-        return json(debug ? { debug: true, ...payload } : payload);
+        const payload = { weather: { ...cw, summary }, context: { family: fam, terms: searchTerms, market, spice, salt: salt32 }, features: mood, track: { id: track.id, name: track.name, artists: track.artists, artist_ids: track.artist_ids, url: track.url, app_uri: track.app_uri, preview_url: track.preview_url } };
+        const resp = json(debug ? { debug: true, ...payload } : payload);
+        resp.headers.set("Set-Cookie", cookie);
+        return resp;
       } catch (err){
         return json({ error: String(err?.message || err), stack: debug ? (err?.stack || null) : undefined }, { status: 500 });
       }
@@ -700,7 +684,9 @@ export default {
         const doy = dayOfYear(feat.timeISO);
         const baseSeed = (Math.floor(lat*1e4) ^ Math.floor(lon*1e4) ^ (feat.hour<<8) ^ (doy<<16)) | 0;
         const saltParam = Number(searchParams.get("salt"));
-        const salt32 = Number.isFinite(saltParam) ? (saltParam | 0) : (crypto.getRandomValues(new Uint32Array(1))[0] | 0);
+        let salt32;
+        if (Number.isFinite(saltParam)) { salt32 = (saltParam | 0) || ((Date.now() & 0xffffffff) | 1); }
+        else { const a = new Uint32Array(1); crypto.getRandomValues(a); salt32 = (a[0] | 0) || ((Date.now() & 0xffffffff) | 1); }
         const rand = rngSeed(baseSeed ^ salt32);
 
         let mood = { ...mood0 };
@@ -719,29 +705,26 @@ export default {
         const terms = buildTerms(rand, fam, neighbor);
         const seeds = (FAMILY_SEEDS[fam] || []);
         let cleanSeeds = Array.from(new Set(seeds.map(normalizeGenre).filter(g=>!banned.has(g))));
-        try {
-          const genresSet = await getAvailableGenres(env);
-          const all = Array.from(genresSet);
-          if (all.length && rand() < (0.45 + 0.30 * spice)) {
-            const extra = all[Math.floor(rand() * all.length)];
-            if (extra) cleanSeeds.push(extra);
-          }
-        } catch(_) {}
+        try { const genresSet = await getAvailableGenres(env); const all = Array.from(genresSet); if (all.length && rand() < (0.45 + 0.30 * spice)) { const extra = all[Math.floor(rand() * all.length)]; if (extra) cleanSeeds.push(extra); } } catch(_){}
         const searchTerms = seedTerms(cleanSeeds.length?cleanSeeds:terms);
 
         const key = recentKey(lat, lon);
-        const recents = getRecents(key);
+        const mem = getRecentsMem(key);
+        const cok = readRecentsCookie(req);
+        const recents = { tids:new Set([...mem.tids, ...cok.tids]), aids:new Set([...mem.aids, ...cok.aids]), anames:new Set([...mem.anames, ...cok.anames]) };
 
-        const track = await recommendAscendingTrack(
-          env, rand, mood, fam, searchTerms,
-          /^[A-Z]{2}$/.test(req.cf?.country||"")?req.cf.country:"US",
-          recents
-        );
+        const track = await recommendAscendingTrack(env, rand, mood, fam, searchTerms, /^[A-Z]{2}$/.test(req.cf?.country||"")?req.cf.country:"US", recents);
 
         if (track) {
-          pushRecent(key, track);
-          const target = `spotify://track/${track.id}`;
-          return Response.redirect(target, 302);
+          pushRecentMem(key, track);
+          const newRec = { tids:new Set(recents.tids), aids:new Set(recents.aids), anames:new Set(recents.anames) };
+          newRec.tids.add(track.id);
+          (track.artist_ids||[]).forEach(id => newRec.aids.add(id));
+          String(track.artists||"").split(",").map(s=>s.trim().toLowerCase()).filter(Boolean).forEach(n=>newRec.anames.add(n));
+          const cookie = cookieFromRecents(newRec);
+          const resp = Response.redirect(`spotify://track/${track.id}`, 302);
+          resp.headers.set("Set-Cookie", cookie);
+          return resp;
         }
         return Response.redirect("https://open.spotify.com/", 302);
       } catch {
