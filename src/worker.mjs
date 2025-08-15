@@ -312,13 +312,14 @@ async function fetchNewReleaseCandidates(env, market, limit=30){
   const tid = slice.map(t=>t.id).join(",");
   const rt = await fetch(`https://api.spotify.com/v1/tracks?ids=${tid}`, { headers: { Authorization: `Bearer ${token}` } });
   if (!rt.ok) return [];
-  const jt = await r.json();
+  const jt = await rt.json();
   const byId = new Map((jt.tracks||[]).map(x=>[x.id,x]));
   return slice.map(t => {
     const full = byId.get(t.id);
     return full ? { ...t, popularity: full.popularity, preview_url: full.preview_url, url: `https://open.spotify.com/track/${t.id}`, app_uri: `spotify://track/${t.id}` } : t;
   });
 }
+
 async function searchAscendingCandidates(env, terms, market, daysBack=240, limit=30){
   const token = await getSpotifyToken(env);
   const yearNow = new Date().getUTCFullYear();
